@@ -280,11 +280,13 @@ int smith_waterman_rows_simd_impl(const std::vector<uint8_t> &seq1,
     // Align buffers for better cache performance
     std::vector<int32_t> prev(len2 + 1 + 16, 0);
     std::vector<int32_t> curr(len2 + 1 + 16, 0);
-    int max_score = 0;
     alignas(64) int32_t buffer[Traits::LANES];
     const int simd_end = (len2 / Traits::LANES) * Traits::LANES;
     const auto gap_vec = Traits::set1(GAP);
     const auto zero_vec = Traits::set1(0);
+    
+    // Track max per row instead of per cell
+    int max_score = 0;
 
     for (int i = 1; i <= len1; ++i) {
         curr[0] = 0;
@@ -314,7 +316,6 @@ int smith_waterman_rows_simd_impl(const std::vector<uint8_t> &seq1,
                 int cell = buffer[lane];
                 if (left > cell) cell = left;
                 curr_ptr[idx] = cell;
-                if (cell > max_score) max_score = cell;
             }
         }
         
@@ -325,8 +326,28 @@ int smith_waterman_rows_simd_impl(const std::vector<uint8_t> &seq1,
             int left = curr_ptr[j - 1] + GAP;
             int cell = std::max({diag, up, left, 0});
             curr_ptr[j] = cell;
-            if (cell > max_score) max_score = cell;
         }
+        
+        // Find max in current row using SIMD after all cells are computed
+        auto row_max_vec = zero_vec;
+        for (int k = 1; k <= simd_end; k += Traits::LANES) {
+            auto vals = Traits::load(curr_ptr + k);
+            row_max_vec = Traits::max(row_max_vec, vals);
+        }
+        
+        // Extract max from SIMD register
+        Traits::store(buffer, row_max_vec);
+        int row_max = 0;
+        for (int lane = 0; lane < Traits::LANES; ++lane) {
+            if (buffer[lane] > row_max) row_max = buffer[lane];
+        }
+        
+        // Check tail elements
+        for (int k = simd_end + 1; k <= len2; ++k) {
+            if (curr_ptr[k] > row_max) row_max = curr_ptr[k];
+        }
+        
+        if (row_max > max_score) max_score = row_max;
         
         std::swap(prev, curr);
     }
