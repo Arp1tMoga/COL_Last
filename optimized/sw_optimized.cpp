@@ -268,88 +268,148 @@ int smith_waterman_rows_scalar(const std::vector<uint8_t> &seq1,
     return max_score;
 }
 
-// Enhanced SIMD with better memory access patterns
+// Striped Smith-Waterman implementation based on SSW library
 template <typename Traits>
 int smith_waterman_rows_simd_impl(const std::vector<uint8_t> &seq1,
                                   const std::vector<uint8_t> &seq2,
                                   const ScoreLookup &score_lookup) {
-    const int len1 = static_cast<int>(seq1.size());
-    const int len2 = static_cast<int>(seq2.size());
-    if (len1 == 0 || len2 == 0) return 0;
+    const int readLen = static_cast<int>(seq1.size());
+    const int refLen = static_cast<int>(seq2.size());
+    if (readLen == 0 || refLen == 0) return 0;
 
-    // Align buffers for better cache performance
-    std::vector<int32_t> prev(len2 + 1 + 16, 0);
-    std::vector<int32_t> curr(len2 + 1 + 16, 0);
-    alignas(64) int32_t buffer[Traits::LANES];
-    const int simd_end = (len2 / Traits::LANES) * Traits::LANES;
-    const auto gap_vec = Traits::set1(GAP);
-    const auto zero_vec = Traits::set1(0);
+    // Calculate segment length - how many segments we need to cover the read
+    const int segLen = (readLen + Traits::LANES - 1) / Traits::LANES;
     
-    // Track max per row instead of per cell
-    int max_score = 0;
-
-    for (int i = 1; i <= len1; ++i) {
-        curr[0] = 0;
-        const auto &scores = score_lookup[seq1[i - 1]];
-        const int32_t * __restrict__ scores_ptr = scores.data();
-        const int32_t * __restrict__ prev_ptr = prev.data();
-        int32_t * __restrict__ curr_ptr = curr.data();
+    // Build striped profile: profile[base][segment]
+    // Each SIMD element in segment j contains scores for positions: j, j+segLen, j+2*segLen, ...
+    // profile[refBase][seg][lane] = score for matching refBase with seq1[readPos]
+    std::vector<std::vector<typename Traits::Reg>> profile(4);
+    for (int refBase = 0; refBase < 4; ++refBase) {
+        profile[refBase].resize(segLen);
+        alignas(64) int32_t temp[Traits::LANES];
         
-        int j = 1;
-        // SIMD main loop
-        for (; j <= simd_end; j += Traits::LANES) {
-            auto diag = Traits::load(prev_ptr + j - 1);
-            auto up = Traits::load(prev_ptr + j);
-            auto sc = Traits::load(scores_ptr + j - 1);
-            
-            diag = Traits::add(diag, sc);
-            up = Traits::add(up, gap_vec);
-            auto best = Traits::max(diag, up);
-            best = Traits::max(best, zero_vec);  // Compute max with 0 in SIMD
-            
-            Traits::store(buffer, best);
-            
-            // Process with left dependency - keep it simple
+        for (int seg = 0; seg < segLen; ++seg) {
             for (int lane = 0; lane < Traits::LANES; ++lane) {
-                int idx = j + lane;
-                int left = curr_ptr[idx - 1] + GAP;
-                int cell = buffer[lane];
-                if (left > cell) cell = left;
-                curr_ptr[idx] = cell;
+                int readPos = seg + lane * segLen;
+                if (readPos < readLen) {
+                    // Score for matching refBase with seq1[readPos]
+                    int readBase = seq1[readPos];
+                    temp[lane] = (refBase == readBase) ? MATCH : MISMATCH;
+                } else {
+                    temp[lane] = 0;
+                }
+            }
+            profile[refBase][seg] = Traits::load(temp);
+        }
+    }
+    
+    // Allocate H, E, F vectors
+    std::vector<typename Traits::Reg> pvHStore(segLen);
+    std::vector<typename Traits::Reg> pvHLoad(segLen);
+    std::vector<typename Traits::Reg> pvE(segLen);
+    
+    const auto vZero = Traits::set1(0);
+    const int gapOpen = -GAP;   // Positive value
+    const int gapExt = -GAP;    // Positive value
+    const auto vGapO = Traits::set1(gapOpen);
+    const auto vGapE = Traits::set1(gapExt);
+    
+    // Initialize all to zero
+    for (int j = 0; j < segLen; ++j) {
+        pvHStore[j] = vZero;
+        pvHLoad[j] = vZero;
+        pvE[j] = vZero;
+    }
+    
+    int max_score = 0;
+    alignas(64) int32_t buffer[Traits::LANES];
+    
+    // Process each reference position (column)
+    for (int i = 0; i < refLen; ++i) {
+        const auto &vP = profile[seq2[i]];  // Get profile for current reference base
+        
+        // Initialize F to zero for this column
+        auto vF = vZero;
+        auto vMaxColumn = vZero;  // Track max for this column
+        
+        // Get last H from previous column and shift it (simulates diagonal access)
+        auto vH = pvHStore[segLen - 1];
+        vH = Traits::shift_left(vH, 4);  // Shift by 4 bytes (1 int32)
+        
+        // Swap H buffers
+        std::swap(pvHLoad, pvHStore);
+        
+        // Inner loop: process each segment
+        for (int j = 0; j < segLen; ++j) {
+            // vH starts as H[i-1, j-1] (diagonal)
+            // Add match/mismatch score
+            vH = Traits::add(vH, vP[j]);
+            
+            // Load E[i-1, j] (insertion - was computed in previous ref position)
+            auto vE = pvE[j];
+            
+            // H = max(H_diag + score, E, F, 0)
+            vH = Traits::max(vH, vE);
+            vH = Traits::max(vH, vF);
+            vH = Traits::max(vH, vZero);
+            
+            // Track max for this column
+            vMaxColumn = Traits::max(vMaxColumn, vH);
+            
+            // Store H[i, j]
+            pvHStore[j] = vH;
+            
+            // Update E for next column: E = max(E - gapE, H - gapO)
+            // E represents insertion (vertical gap in reference)
+            vH = Traits::sub_sat(vH, vGapO);  // H - gapOpen
+            vE = Traits::sub_sat(vE, vGapE);  // E - gapExtend
+            vE = Traits::max(vE, vH);
+            pvE[j] = vE;
+            
+            // Update F for next segment: F = max(F - gapE, H - gapO)
+            // F represents deletion (horizontal gap in read)
+            vF = Traits::sub_sat(vF, vGapE);  // F - gapExtend
+            vF = Traits::max(vF, vH);
+            
+            // Load next H for next iteration (becomes diagonal in next segment)
+            vH = pvHLoad[j];
+        }
+        
+        // Lazy F loop: propagate F across segments
+        // This handles deletions that span multiple segments
+        for (int k = 0; k < Traits::LANES; ++k) {
+            vF = Traits::shift_left(vF, 4);
+            
+            bool allDone = true;
+            for (int j = 0; j < segLen; ++j) {
+                vH = pvHStore[j];
+                vH = Traits::max(vH, vF);
+                
+                // Update max after lazy F correction
+                vMaxColumn = Traits::max(vMaxColumn, vH);
+                
+                pvHStore[j] = vH;
+                
+                vH = Traits::sub_sat(vH, vGapO);
+                vF = Traits::sub_sat(vF, vGapE);
+                
+                // Check if F > H (more propagation needed)
+                auto vTemp = Traits::sub_sat(vF, vH);
+                if (!Traits::all_zero(vTemp)) {
+                    allDone = false;
+                }
+            }
+            
+            if (allDone) break;
+        }
+        
+        // Extract max from this column and update global max
+        Traits::store(buffer, vMaxColumn);
+        for (int lane = 0; lane < Traits::LANES; ++lane) {
+            if (buffer[lane] > max_score) {
+                max_score = buffer[lane];
             }
         }
-        
-        // Tail processing
-        for (; j <= len2; ++j) {
-            int diag = prev_ptr[j - 1] + scores_ptr[j - 1];
-            int up = prev_ptr[j] + GAP;
-            int left = curr_ptr[j - 1] + GAP;
-            int cell = std::max({diag, up, left, 0});
-            curr_ptr[j] = cell;
-        }
-        
-        // Find max in current row using SIMD after all cells are computed
-        auto row_max_vec = zero_vec;
-        for (int k = 1; k <= simd_end; k += Traits::LANES) {
-            auto vals = Traits::load(curr_ptr + k);
-            row_max_vec = Traits::max(row_max_vec, vals);
-        }
-        
-        // Extract max from SIMD register
-        Traits::store(buffer, row_max_vec);
-        int row_max = 0;
-        for (int lane = 0; lane < Traits::LANES; ++lane) {
-            if (buffer[lane] > row_max) row_max = buffer[lane];
-        }
-        
-        // Check tail elements
-        for (int k = simd_end + 1; k <= len2; ++k) {
-            if (curr_ptr[k] > row_max) row_max = curr_ptr[k];
-        }
-        
-        if (row_max > max_score) max_score = row_max;
-        
-        std::swap(prev, curr);
     }
 
     return max_score;
@@ -367,6 +427,18 @@ struct TraitsSSE41 {
     static inline Reg add(Reg a, Reg b) { return _mm_add_epi32(a, b); }
     static inline Reg max(Reg a, Reg b) { return _mm_max_epi32(a, b); }
     static inline Reg set1(int v) { return _mm_set1_epi32(v); }
+    static inline Reg sub_sat(Reg a, Reg b) {
+        // Saturated subtraction for signed 32-bit integers
+        // Convert to signed, subtract, clamp to 0
+        auto diff = _mm_sub_epi32(a, b);
+        return _mm_max_epi32(diff, _mm_setzero_si128());
+    }
+    static inline Reg shift_left(Reg a, int bytes) {
+        return _mm_slli_si128(a, bytes);
+    }
+    static inline bool all_zero(Reg a) {
+        return _mm_testz_si128(a, a) != 0;
+    }
 };
 
 struct TraitsAVX2 {
@@ -381,6 +453,39 @@ struct TraitsAVX2 {
     static inline Reg add(Reg a, Reg b) { return _mm256_add_epi32(a, b); }
     static inline Reg max(Reg a, Reg b) { return _mm256_max_epi32(a, b); }
     static inline Reg set1(int v) { return _mm256_set1_epi32(v); }
+    static inline Reg sub_sat(Reg a, Reg b) {
+        auto diff = _mm256_sub_epi32(a, b);
+        return _mm256_max_epi32(diff, _mm256_setzero_si256());
+    }
+    static inline Reg shift_left(Reg a, int bytes) {
+        // Shift entire 256-bit register left by bytes
+        // Need to use permute and blend since there's no direct shift across 128-bit lanes
+        if (bytes == 0) return a;
+        if (bytes >= 32) return _mm256_setzero_si256();
+        
+        // For 4 bytes (1 int32), shift each 128-bit lane and carry across
+        if (bytes == 4) {
+            auto shifted = _mm256_slli_si256(a, 4);
+            auto perm = _mm256_permute2x128_si256(a, a, 0x08); // Swap lanes
+            auto carry = _mm256_srli_si256(perm, 12);
+            return _mm256_or_si256(shifted, carry);
+        }
+        
+        // Generic fallback
+        alignas(32) int32_t buffer[8];
+        _mm256_store_si256(reinterpret_cast<__m256i*>(buffer), a);
+        int shift_elems = bytes / 4;
+        for (int i = 7; i >= shift_elems; --i) {
+            buffer[i] = buffer[i - shift_elems];
+        }
+        for (int i = 0; i < shift_elems; ++i) {
+            buffer[i] = 0;
+        }
+        return _mm256_load_si256(reinterpret_cast<const __m256i*>(buffer));
+    }
+    static inline bool all_zero(Reg a) {
+        return _mm256_testz_si256(a, a) != 0;
+    }
 };
 
 struct TraitsAVX512 {
@@ -400,6 +505,29 @@ struct TraitsAVX512 {
     }
     TARGET_AVX512_ATTR static inline Reg set1(int v) { 
         return _mm512_set1_epi32(v); 
+    }
+    TARGET_AVX512_ATTR static inline Reg sub_sat(Reg a, Reg b) {
+        auto diff = _mm512_sub_epi32(a, b);
+        return _mm512_max_epi32(diff, _mm512_setzero_si512());
+    }
+    TARGET_AVX512_ATTR static inline Reg shift_left(Reg a, int bytes) {
+        // For AVX512, use alignr across the full register
+        if (bytes == 0) return a;
+        if (bytes >= 64) return _mm512_setzero_si512();
+        
+        alignas(64) int32_t buffer[16];
+        _mm512_store_si512(buffer, a);
+        int shift_elems = bytes / 4;
+        for (int i = 15; i >= shift_elems; --i) {
+            buffer[i] = buffer[i - shift_elems];
+        }
+        for (int i = 0; i < shift_elems; ++i) {
+            buffer[i] = 0;
+        }
+        return _mm512_load_si512(buffer);
+    }
+    TARGET_AVX512_ATTR static inline bool all_zero(Reg a) {
+        return _mm512_test_epi32_mask(a, a) == 0;
     }
 };
 
