@@ -1,0 +1,12 @@
+.vscode
+*.o
+*.out
+*.exe
+node_modules
+dist
+build
+*.log
+.DS_Store
+*.prof
+*.svg
+.json
