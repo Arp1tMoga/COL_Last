@@ -6,7 +6,9 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -65,36 +67,75 @@ inline int match_score(uint8_t a, uint8_t b) {
     return SCORE_TABLE[(a << 2) | b];
 }
 
-int smith_waterman_optimized(const std::vector<uint8_t> &seq1,
-                             const std::vector<uint8_t> &seq2) {
+std::array<std::vector<int16_t>, 4> build_score_lookup(const std::vector<uint8_t> &seq) {
+    std::array<std::vector<int16_t>, 4> lookup = {
+        std::vector<int16_t>(seq.size(), MISMATCH),
+        std::vector<int16_t>(seq.size(), MISMATCH),
+        std::vector<int16_t>(seq.size(), MISMATCH),
+        std::vector<int16_t>(seq.size(), MISMATCH)};
+
+    for (std::size_t j = 0; j < seq.size(); ++j) {
+        lookup[seq[j]][j] = MATCH;
+    }
+
+    return lookup;
+}
+
+template <typename ScoreT>
+int smith_waterman_rows(const std::vector<uint8_t> &seq1,
+                        const std::vector<uint8_t> &seq2,
+                        const std::array<std::vector<int16_t>, 4> &score_lookup) {
     const int len1 = static_cast<int>(seq1.size());
     const int len2 = static_cast<int>(seq2.size());
 
-    std::vector<int> prev(len2 + 1, 0);
-    std::vector<int> curr(len2 + 1, 0);
+    std::vector<ScoreT> prev(len2 + 1, 0);
+    std::vector<ScoreT> curr(len2 + 1, 0);
 
     int max_score = 0;
 
     for (int i = 1; i <= len1; ++i) {
         curr[0] = 0;
-        const uint8_t base1 = seq1[i - 1];
+        const auto &scores = score_lookup[seq1[i - 1]];
         for (int j = 1; j <= len2; ++j) {
-            const int diag = prev[j - 1] + match_score(base1, seq2[j - 1]);
-            const int up = prev[j] + GAP;
-            const int left = curr[j - 1] + GAP;
+            int diag = static_cast<int>(prev[j - 1]) + static_cast<int>(scores[j - 1]);
+            int up = static_cast<int>(prev[j]) + GAP;
+            int left = static_cast<int>(curr[j - 1]) + GAP;
 
             int cell = diag;
             cell = (cell > up) ? cell : up;
             cell = (cell > left) ? cell : left;
             cell = (cell > 0) ? cell : 0;
 
-            curr[j] = cell;
+            if constexpr (std::is_same_v<ScoreT, int16_t>) {
+                if (cell > std::numeric_limits<int16_t>::max()) {
+                    cell = std::numeric_limits<int16_t>::max();
+                }
+            }
+
+            curr[j] = static_cast<ScoreT>(cell);
             max_score = (max_score > cell) ? max_score : cell;
         }
         std::swap(prev, curr);
     }
 
     return max_score;
+}
+
+int smith_waterman_optimized(const std::vector<uint8_t> &seq1,
+                             const std::vector<uint8_t> &seq2) {
+    if (seq1.empty() || seq2.empty()) {
+        return 0;
+    }
+
+    const auto score_lookup = build_score_lookup(seq2);
+    const long long max_possible = static_cast<long long>(MATCH) *
+                                   static_cast<long long>(std::min(seq1.size(), seq2.size()));
+
+    if (max_possible <= std::numeric_limits<int16_t>::max()) {
+        return smith_waterman_rows<int16_t>(seq1, seq2, score_lookup);
+    }
+
+    return smith_waterman_rows<int32_t>(seq1, seq2, score_lookup);
 }
 
 } // namespace
