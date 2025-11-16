@@ -281,10 +281,9 @@ int smith_waterman_rows_simd_impl(const std::vector<uint8_t> &seq1,
     std::vector<int32_t> prev(len2 + 1 + 16, 0);
     std::vector<int32_t> curr(len2 + 1 + 16, 0);
     int max_score = 0;
-    alignas(64) int32_t buffer[Traits::LANES];
+    alignas(64) int32_t buffer[Traits::LANES * 2];
     const int simd_end = (len2 / Traits::LANES) * Traits::LANES;
     const auto gap_vec = Traits::set1(GAP);
-    const auto zero_vec = Traits::set1(0);
 
     for (int i = 1; i <= len1; ++i) {
         curr[0] = 0;
@@ -303,18 +302,18 @@ int smith_waterman_rows_simd_impl(const std::vector<uint8_t> &seq1,
             diag = Traits::add(diag, sc);
             up = Traits::add(up, gap_vec);
             auto best = Traits::max(diag, up);
-            best = Traits::max(best, zero_vec);  // Compute max with 0 in SIMD
             
             Traits::store(buffer, best);
             
-            // Process with left dependency - keep it simple
+            // Process with left dependency
             for (int lane = 0; lane < Traits::LANES; ++lane) {
                 int idx = j + lane;
                 int left = curr_ptr[idx - 1] + GAP;
                 int cell = buffer[lane];
-                if (left > cell) cell = left;
+                cell = (cell > left) ? cell : left;
+                cell = (cell > 0) ? cell : 0;
                 curr_ptr[idx] = cell;
-                if (cell > max_score) max_score = cell;
+                max_score = (cell > max_score) ? cell : max_score;
             }
         }
         
@@ -325,7 +324,7 @@ int smith_waterman_rows_simd_impl(const std::vector<uint8_t> &seq1,
             int left = curr_ptr[j - 1] + GAP;
             int cell = std::max({diag, up, left, 0});
             curr_ptr[j] = cell;
-            if (cell > max_score) max_score = cell;
+            max_score = (cell > max_score) ? cell : max_score;
         }
         
         std::swap(prev, curr);
