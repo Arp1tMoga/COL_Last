@@ -380,28 +380,21 @@ int smith_waterman_rows_simd_impl(const std::vector<uint8_t> &seq1,
         for (int k = 0; k < Traits::LANES; ++k) {
             vF = Traits::shift_left(vF, 4);
             
-            bool allDone = true;
             for (int j = 0; j < segLen; ++j) {
                 vH = pvHStore[j];
                 vH = Traits::max(vH, vF);
-                
-                // Update max after lazy F correction
                 vMaxColumn = Traits::max(vMaxColumn, vH);
-                
                 pvHStore[j] = vH;
                 
                 vH = Traits::sub_sat(vH, vGapO);
                 vF = Traits::sub_sat(vF, vGapE);
                 
-                // Check if F > H (more propagation needed)
+                // Early exit: if F <= H everywhere, no more propagation needed
                 auto vTemp = Traits::sub_sat(vF, vH);
-                if (!Traits::all_zero(vTemp)) {
-                    allDone = false;
-                }
+                if (Traits::all_zero(vTemp)) goto lazy_f_done;
             }
-            
-            if (allDone) break;
         }
+        lazy_f_done:;
         
         // Extract max from this column and update global max
         Traits::store(buffer, vMaxColumn);
