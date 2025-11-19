@@ -339,14 +339,97 @@ int smith_waterman_rows_simd_impl(const std::vector<uint8_t> &seq1,
         // Swap H buffers
         std::swap(pvHLoad, pvHStore);
         
+        // Raw pointers for faster access
+        typename Traits::Reg* __restrict__ pE = pvE.data();
+        typename Traits::Reg* __restrict__ pHStore = pvHStore.data();
+        const typename Traits::Reg* __restrict__ pHLoad = pvHLoad.data();
+        const typename Traits::Reg* __restrict__ pP = vP.data();
+
         // Inner loop: process each segment
-        for (int j = 0; j < segLen; ++j) {
+        // Unrolled by 4
+        int j = 0;
+        for (; j + 3 < segLen; j += 4) {
+            // Prefetch next iterations
+            _mm_prefetch(reinterpret_cast<const char*>(&pE[j + 8]), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(&pHLoad[j + 8]), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(&pP[j + 8]), _MM_HINT_T0);
+
+            auto vH0 = vH;
+            auto vH1 = pHLoad[j];
+            auto vH2 = pHLoad[j + 1];
+            auto vH3 = pHLoad[j + 2];
+
+            // Iteration 0
+            vH0 = Traits::add(vH0, pP[j]);
+            auto vE0 = pE[j];
+            vH0 = Traits::max(vH0, vE0);
+            vH0 = Traits::max(vH0, vF);
+            vH0 = Traits::max(vH0, vZero);
+            vMaxColumn = Traits::max(vMaxColumn, vH0);
+            pHStore[j] = vH0;
+            vH0 = Traits::sub_sat(vH0, vGapO);
+            vE0 = Traits::sub_sat(vE0, vGapE);
+            vE0 = Traits::max(vE0, vH0);
+            pE[j] = vE0;
+            vF = Traits::sub_sat(vF, vGapE);
+            vF = Traits::max(vF, vH0);
+
+            // Iteration 1
+            vH1 = Traits::add(vH1, pP[j + 1]);
+            auto vE1 = pE[j + 1];
+            vH1 = Traits::max(vH1, vE1);
+            vH1 = Traits::max(vH1, vF);
+            vH1 = Traits::max(vH1, vZero);
+            vMaxColumn = Traits::max(vMaxColumn, vH1);
+            pHStore[j + 1] = vH1;
+            vH1 = Traits::sub_sat(vH1, vGapO);
+            vE1 = Traits::sub_sat(vE1, vGapE);
+            vE1 = Traits::max(vE1, vH1);
+            pE[j + 1] = vE1;
+            vF = Traits::sub_sat(vF, vGapE);
+            vF = Traits::max(vF, vH1);
+
+            // Iteration 2
+            vH2 = Traits::add(vH2, pP[j + 2]);
+            auto vE2 = pE[j + 2];
+            vH2 = Traits::max(vH2, vE2);
+            vH2 = Traits::max(vH2, vF);
+            vH2 = Traits::max(vH2, vZero);
+            vMaxColumn = Traits::max(vMaxColumn, vH2);
+            pHStore[j + 2] = vH2;
+            vH2 = Traits::sub_sat(vH2, vGapO);
+            vE2 = Traits::sub_sat(vE2, vGapE);
+            vE2 = Traits::max(vE2, vH2);
+            pE[j + 2] = vE2;
+            vF = Traits::sub_sat(vF, vGapE);
+            vF = Traits::max(vF, vH2);
+
+            // Iteration 3
+            vH3 = Traits::add(vH3, pP[j + 3]);
+            auto vE3 = pE[j + 3];
+            vH3 = Traits::max(vH3, vE3);
+            vH3 = Traits::max(vH3, vF);
+            vH3 = Traits::max(vH3, vZero);
+            vMaxColumn = Traits::max(vMaxColumn, vH3);
+            pHStore[j + 3] = vH3;
+            vH3 = Traits::sub_sat(vH3, vGapO);
+            vE3 = Traits::sub_sat(vE3, vGapE);
+            vE3 = Traits::max(vE3, vH3);
+            pE[j + 3] = vE3;
+            vF = Traits::sub_sat(vF, vGapE);
+            vF = Traits::max(vF, vH3);
+
+            // Prepare vH for next iteration (it becomes the diagonal)
+            vH = pHLoad[j + 3];
+        }
+
+        for (; j < segLen; ++j) {
             // vH starts as H[i-1, j-1] (diagonal)
             // Add match/mismatch score
-            vH = Traits::add(vH, vP[j]);
+            vH = Traits::add(vH, pP[j]);
             
             // Load E[i-1, j] (insertion - was computed in previous ref position)
-            auto vE = pvE[j];
+            auto vE = pE[j];
             
             // H = max(H_diag + score, E, F, 0)
             vH = Traits::max(vH, vE);
@@ -357,14 +440,14 @@ int smith_waterman_rows_simd_impl(const std::vector<uint8_t> &seq1,
             vMaxColumn = Traits::max(vMaxColumn, vH);
             
             // Store H[i, j]
-            pvHStore[j] = vH;
+            pHStore[j] = vH;
             
             // Update E for next column: E = max(E - gapE, H - gapO)
             // E represents insertion (vertical gap in reference)
             vH = Traits::sub_sat(vH, vGapO);  // H - gapOpen
             vE = Traits::sub_sat(vE, vGapE);  // E - gapExtend
             vE = Traits::max(vE, vH);
-            pvE[j] = vE;
+            pE[j] = vE;
             
             // Update F for next segment: F = max(F - gapE, H - gapO)
             // F represents deletion (horizontal gap in read)
@@ -372,7 +455,7 @@ int smith_waterman_rows_simd_impl(const std::vector<uint8_t> &seq1,
             vF = Traits::max(vF, vH);
             
             // Load next H for next iteration (becomes diagonal in next segment)
-            vH = pvHLoad[j];
+            vH = pHLoad[j];
         }
         
         // Lazy F loop: propagate F across segments

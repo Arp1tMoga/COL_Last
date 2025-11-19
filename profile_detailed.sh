@@ -2,7 +2,7 @@
 # Complete profiling workflow for line-level analysis
 
 echo "=== Compiling with O3 and debug symbols ==="
-g++ optimized/sw_optimized.cpp -O3 -g3 -fno-omit-frame-pointer -mavx2 -march=native -fopenmp -std=c++17 -o optimized/sw_opt_profile
+g++ optimized/sw_optimized.cpp -O3 -g3 -fno-omit-frame-pointer -mavx2 -fopenmp -std=c++17 -o optimized/sw_optimized
 
 echo ""
 echo "=== Running Callgrind (this will take a while...) ==="
